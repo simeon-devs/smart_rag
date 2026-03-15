@@ -39,3 +39,4 @@ node_modules/
 # Not part of the MARA root project
 /braight/
 /old_files/
+frontend_ref/
