@@ -1,7 +1,7 @@
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 qdrant-client==1.17.0
-torch==2.2.2+cpu --extra-index-url https://download.pytorch.org/whl/cpu
 sentence-transformers==3.0.1
 groq==0.31.0
 python-dotenv==1.1.1
+requests==2.32.3

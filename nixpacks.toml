@@ -1,0 +1,5 @@
+[phases.install]
+cmds = [
+  "pip install torch==2.2.2+cpu --extra-index-url https://download.pytorch.org/whl/cpu --no-cache-dir",
+  "pip install -r requirements.txt --no-cache-dir"
+]
