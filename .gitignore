@@ -33,6 +33,9 @@ products_real*.json
 ARCHITECTURE.md
 CONTEXT.md
 
+# Node
+node_modules/
+
 # Not part of the MARA root project
 /braight/
 /old_files/

@@ -30,6 +30,7 @@ class UserConstraints:
     kelvin_min:           Optional[float] = None
     kelvin_max:           Optional[float] = None
     room_type:            Optional[str]   = None
+    location:             Optional[str]   = None   # "outdoor" | "indoor"
 
 
 @dataclass
@@ -74,6 +75,38 @@ LAMBDA = {
     "episodic": 0.30,   # recent browsing — fades fast
 }
 
+# Same keyword list as setup_qdrant.py — filters accessories post-retrieval
+# so the current live Qdrant data is clean even before a full re-index.
+_ACCESSORY_KEYWORDS = (
+    "kit ",
+    "bracket",
+    "cover",
+    "accessory",
+    "accessories",
+    "abdeckung",
+    "einbaurahmen",
+    "gegengewicht",
+    "staffa",
+    "rotazione",
+    "seil",
+    "schiene",
+    "rail",
+    "halter",
+    "end cap",
+    "adapter",
+)
+
+
+def _is_accessory(name: str, wattage: Optional[float], price_chf: Optional[float]) -> bool:
+    """Return True if the product looks like an accessory/spare part."""
+    low = name.lower()
+    for kw in _ACCESSORY_KEYWORDS:
+        if kw in low:
+            return True
+    if wattage is None and price_chf is not None and price_chf < 20:
+        return True
+    return False
+
 
 def decay(initial_score: float, memory_type: str, time_elapsed_days: float) -> float:
     """Apply exponential decay to a score."""
@@ -108,9 +141,9 @@ def constraint_weight(product: dict, constraints: UserConstraints) -> tuple[floa
             )
 
     if constraints.forbidden_materials:
-        if material is None:
-            violations.append("× material unknown")
-        else:
+        if material is not None:
+            # Only flag if we know the material and it IS forbidden.
+            # A product with unknown material is treated as neutral.
             mat = str(material).lower()
             for forbidden in constraints.forbidden_materials:
                 if forbidden.lower() in mat:
@@ -133,9 +166,9 @@ def constraint_weight(product: dict, constraints: UserConstraints) -> tuple[floa
             )
 
     if constraints.room_type is not None:
-        if room_type is None:
-            violations.append("× room type unknown")
-        elif str(room_type).lower() != constraints.room_type.lower():
+        # Only flag if the catalog specifies a DIFFERENT room type.
+        # Products with no room_type metadata are treated as general-purpose.
+        if room_type is not None and str(room_type).lower() != constraints.room_type.lower():
             violations.append(
                 f"× room type '{room_type}' doesn't match '{constraints.room_type}'"
             )
@@ -170,7 +203,7 @@ def get_client() -> QdrantClient:
 
 
 def build_qdrant_filter(constraints: UserConstraints) -> Optional[Filter]:
-    """Build a Qdrant pre-filter from strict numeric constraints."""
+    """Build a Qdrant pre-filter from strict numeric and boolean constraints."""
     conditions = []
 
     if constraints.max_wattage is not None:
@@ -197,6 +230,20 @@ def build_qdrant_filter(constraints: UserConstraints) -> Optional[Filter]:
             range=Range(lte=constraints.kelvin_max)
         ))
 
+    if constraints.location is not None:
+        loc = constraints.location.lower()
+        if loc == "outdoor":
+            # Match products where outside=True (payload bool field).
+            conditions.append(FieldCondition(
+                key="outside",
+                match=MatchValue(value=True)
+            ))
+        elif loc == "indoor":
+            conditions.append(FieldCondition(
+                key="inside",
+                match=MatchValue(value=True)
+            ))
+
     if not conditions:
         return None
 
@@ -217,6 +264,8 @@ def run_baseline(query_vector: list[float], top_k: int = TOP_K) -> list[dict]:
     output = []
     for r in results:
         p = r.payload
+        if _is_accessory(p.get("name", ""), None, None):
+            continue
         output.append({
             "product_id":       p.get("product_id"),
             "source_article_id": p.get("source_article_id"),
@@ -238,15 +287,19 @@ def run_baseline(query_vector: list[float], top_k: int = TOP_K) -> list[dict]:
     return output
 
 
-def run_mara(
+def _fetch_and_score(
+    client: QdrantClient,
     query_vector: list[float],
     constraints: UserConstraints,
     preferences: UserPreferences,
-    top_k: int = TOP_K,
+    top_k: int,
 ) -> list[ScoredProduct]:
-    """Return MARA-ranked results using filters, decay, and preference boosts."""
-    client = get_client()
+    """Single retrieval + scoring pass with the given constraints.
 
+    Fetches top_k*3 candidates from both collections, filters accessories,
+    applies constraint checking + preference boosts, and returns the top_k
+    scored products sorted by final_score descending.
+    """
     qdrant_filter = build_qdrant_filter(constraints)
 
     hard_results = client.query_points(
@@ -272,41 +325,105 @@ def run_mara(
     scored = []
 
     for r in hard_results:
-        hp = r.payload   # hard payload
-        sp = soft_lookup.get(hp.get("product_id"), {})  # soft payload
+        hp = r.payload
+        if _is_accessory(hp.get("name", ""), hp.get("wattage"), hp.get("price_chf")):
+            continue
+        sp = soft_lookup.get(hp.get("product_id"), {})
 
-        similarity = r.score
-
+        similarity         = r.score
         c_weight, violations = constraint_weight(hp, constraints)
         decayed_similarity = decay(similarity, "hard", 0)
-        boost = preference_boost(sp, preferences)
-        final = (decayed_similarity + boost) * c_weight
+        boost              = preference_boost(sp, preferences)
+        final              = (decayed_similarity + boost) * c_weight
 
         scored.append(ScoredProduct(
-            product_id       = hp.get("product_id", ""),
-            source_article_id = hp.get("source_article_id"),
+            product_id            = hp.get("product_id", ""),
+            source_article_id     = hp.get("source_article_id"),
             source_article_number = hp.get("source_article_number"),
-            source_l_number = hp.get("source_l_number"),
-            name             = hp.get("name", ""),
-            manufacturer     = hp.get("manufacturer") or sp.get("manufacturer"),
-            category         = hp.get("category") or sp.get("category"),
-            family           = hp.get("family") or sp.get("family"),
-            price_chf        = hp.get("price_chf"),
-            wattage          = hp.get("wattage"),
-            kelvin           = hp.get("kelvin"),
-            material         = hp.get("material"),
-            style            = sp.get("style"),
-            finish           = sp.get("finish"),
-            mood             = sp.get("mood"),
-            room_type        = hp.get("room_type"),
-            image_url        = hp.get("image_url") or sp.get("image_url"),
-            tags             = sp.get("tags", []),
-            similarity_score = round(similarity, 4),
-            decay_score      = round(decayed_similarity, 4),
-            final_score      = round(final, 4),
-            violations       = violations,
+            source_l_number       = hp.get("source_l_number"),
+            name                  = hp.get("name", ""),
+            manufacturer          = hp.get("manufacturer") or sp.get("manufacturer"),
+            category              = hp.get("category") or sp.get("category"),
+            family                = hp.get("family") or sp.get("family"),
+            price_chf             = hp.get("price_chf"),
+            wattage               = hp.get("wattage"),
+            kelvin                = hp.get("kelvin"),
+            material              = hp.get("material"),
+            style                 = sp.get("style"),
+            finish                = sp.get("finish"),
+            mood                  = sp.get("mood"),
+            room_type             = hp.get("room_type"),
+            image_url             = hp.get("image_url") or sp.get("image_url"),
+            tags                  = sp.get("tags", []),
+            similarity_score      = round(similarity, 4),
+            decay_score           = round(decayed_similarity, 4),
+            final_score           = round(final, 4),
+            violations            = violations,
         ))
 
     scored.sort(key=lambda x: x.final_score, reverse=True)
-
     return scored[:top_k]
+
+
+def run_mara(
+    query_vector: list[float],
+    constraints: UserConstraints,
+    preferences: UserPreferences,
+    top_k: int = TOP_K,
+) -> list[ScoredProduct]:
+    """Return MARA-ranked results using filters, decay, and preference boosts.
+
+    Price-relaxation fallback
+    ─────────────────────────
+    Strict price constraints can leave the user with very few clean results.
+    To keep the UI useful, we progressively relax ONLY the price constraint:
+
+      Attempt 1  — full constraints as given by the user.
+      Attempt 2  — price budget relaxed by +20% (gives a little headroom).
+      Attempt 3  — price constraint removed entirely (no upper limit).
+
+    Wattage and material constraints are NEVER relaxed — they represent hard
+    safety/preference requirements the user explicitly set.
+
+    The fallback only kicks in when fewer than 3 products are clean (no
+    violations). If the initial query already yields ≥ 3 clean products, or
+    if no price constraint is active, we return immediately.
+    """
+    client = get_client()
+
+    # Attempt 1: full user constraints.
+    results = _fetch_and_score(client, query_vector, constraints, preferences, top_k)
+    clean_count = sum(1 for p in results if not p.violations)
+
+    if clean_count >= 3 or constraints.max_price_chf is None:
+        return results
+
+    # Attempt 2: relax price by +20%.
+    relaxed_price = constraints.max_price_chf * 1.20
+    relaxed_constraints = UserConstraints(
+        max_wattage         = constraints.max_wattage,
+        max_price_chf       = relaxed_price,
+        forbidden_materials = constraints.forbidden_materials,
+        kelvin_min          = constraints.kelvin_min,
+        kelvin_max          = constraints.kelvin_max,
+        room_type           = constraints.room_type,
+    )
+    results = _fetch_and_score(client, query_vector, relaxed_constraints, preferences, top_k)
+    clean_count = sum(1 for p in results if not p.violations)
+    print(f"[run_mara] price relaxed +20% ({relaxed_price:.0f} CHF) → {clean_count} clean results")
+
+    if clean_count >= 3:
+        return results
+
+    # Attempt 3: remove price constraint entirely.
+    no_price_constraints = UserConstraints(
+        max_wattage         = constraints.max_wattage,
+        max_price_chf       = None,
+        forbidden_materials = constraints.forbidden_materials,
+        kelvin_min          = constraints.kelvin_min,
+        kelvin_max          = constraints.kelvin_max,
+        room_type           = constraints.room_type,
+    )
+    results = _fetch_and_score(client, query_vector, no_price_constraints, preferences, top_k)
+    print(f"[run_mara] price removed entirely → {sum(1 for p in results if not p.violations)} clean results")
+    return results

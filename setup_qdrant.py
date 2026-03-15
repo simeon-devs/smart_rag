@@ -23,7 +23,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
 
 from embeddings import embed_batch
 
@@ -146,6 +146,49 @@ def flatten_product(product: dict[str, Any]) -> dict[str, Any]:
     if "source" not in product or "identity" not in product:
         raise ValueError("Catalog records must use the canonical MARA schema. Run extract_supabase_catalog.py first.")
     return flatten_canonical_product(product)
+
+
+# Keywords that identify accessories/spare parts — matched case-insensitively
+# against the product name.  Any hit → excluded from indexing.
+_ACCESSORY_KEYWORDS = (
+    "kit ",
+    "bracket",
+    "cover",
+    "accessory",
+    "accessories",
+    "abdeckung",
+    "einbaurahmen",
+    "gegengewicht",
+    "staffa",
+    "rotazione",
+    "seil",
+    "schiene",
+    "rail",
+    "halter",
+    "end cap",
+    "adapter",
+)
+
+
+def is_accessory(product: dict[str, Any]) -> bool:
+    """Return True if the product looks like an accessory/spare part.
+
+    Two signals are used:
+    1. Name contains a known accessory keyword (case-insensitive).
+    2. Wattage is absent AND price is below 20 CHF  (cheap hardware with no
+       light source — catches anything the keyword list misses).
+    """
+    name = (product.get("name") or "").lower()
+    for kw in _ACCESSORY_KEYWORDS:
+        if kw in name:
+            return True
+
+    wattage   = product.get("wattage")
+    price_chf = product.get("price_chf")
+    if wattage is None and price_chf is not None and price_chf < 20:
+        return True
+
+    return False
 
 
 def build_hard_text(product: dict[str, Any]) -> str:
@@ -278,7 +321,11 @@ def upload_points(client: QdrantClient, collection_name: str, points: list[Point
 
 
 def index_products(client: QdrantClient, products: list[dict[str, Any]]) -> None:
-    flattened = [flatten_product(product) for product in products]
+    all_flat = [flatten_product(product) for product in products]
+
+    flattened = [p for p in all_flat if not is_accessory(p)]
+    skipped   = len(all_flat) - len(flattened)
+    print(f"  Filtered {skipped} accessories → {len(flattened)} luminaires remaining")
 
     for product in flattened[:3]:
         print(f"  Prepared {product['product_id']} — {product['name']}")
@@ -319,6 +366,35 @@ def index_products(client: QdrantClient, products: list[dict[str, Any]]) -> None
     print(f"\nIndexed {len(flattened)} products into both collections.")
 
 
+def create_payload_indices(client: QdrantClient) -> None:
+    """Create payload indices required for Qdrant filters.
+
+    Float indices — required for Range() conditions (wattage, price_chf, kelvin).
+    Bool indices  — required for MatchValue(True/False) on inside/outside fields.
+    Without these, filtered queries return HTTP 400.
+    """
+    numeric_fields = ["wattage", "price_chf", "kelvin"]
+    for collection in [COLLECTION_HARD, COLLECTION_SOFT]:
+        for field in numeric_fields:
+            client.create_payload_index(
+                collection_name=collection,
+                field_name=field,
+                field_schema=PayloadSchemaType.FLOAT,
+            )
+            print(f"  Created float index on {collection}.{field}")
+
+    # inside/outside only exist in hard_constraints (bool payload fields)
+    for field in ["inside", "outside"]:
+        client.create_payload_index(
+            collection_name=COLLECTION_HARD,
+            field_name=field,
+            field_schema=PayloadSchemaType.BOOL,
+        )
+        print(f"  Created bool index on {COLLECTION_HARD}.{field}")
+
+    print()
+
+
 def verify(client: QdrantClient) -> None:
     print("\n─── Verification ───────────────────────────")
     for name in [COLLECTION_HARD, COLLECTION_SOFT]:
@@ -346,6 +422,9 @@ def main() -> None:
 
     print("Indexing products ...")
     index_products(client, products)
+
+    print("Creating numeric payload indices ...")
+    create_payload_indices(client)
 
     verify(client)
 

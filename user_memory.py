@@ -17,6 +17,7 @@ from qdrant_client.models import (
     FieldCondition,
     MatchValue,
     PayloadSchemaType,
+    PointIdsList,
 )
 
 env_path = Path(__file__).resolve().parent / ".env"
@@ -86,10 +87,74 @@ def _decay(memory_type: str, timestamp: float) -> float:
     return math.exp(-lam * days_elapsed)
 
 
+def _delete_field_memories(client: QdrantClient, user_id: str, text_prefix: str) -> int:
+    """Delete all structural memories for a user whose text starts with text_prefix.
+
+    Used before saving an updated constraint so only the latest value is kept.
+    Qdrant doesn't support prefix-match filters, so we scroll + delete by ID.
+    Returns the number of entries deleted.
+    """
+    user_filter = Filter(
+        must=[
+            FieldCondition(key="user_id",     match=MatchValue(value=user_id)),
+            FieldCondition(key="memory_type", match=MatchValue(value="structural")),
+        ]
+    )
+    results, _ = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=user_filter,
+        limit=100,
+        with_payload=True,
+        with_vectors=False,
+    )
+    ids_to_delete = [
+        point.id for point in results
+        if (point.payload.get("text") or "").startswith(text_prefix)
+    ]
+    if ids_to_delete:
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=PointIdsList(points=ids_to_delete),
+        )
+        print(f"  Deleted {len(ids_to_delete)} old '{text_prefix}*' memories for {user_id}")
+    return len(ids_to_delete)
+
+
+def _text_already_exists(client: QdrantClient, user_id: str, memory_type: str, text: str) -> bool:
+    """Return True if an identical text entry already exists for this user."""
+    user_filter = Filter(
+        must=[
+            FieldCondition(key="user_id",     match=MatchValue(value=user_id)),
+            FieldCondition(key="memory_type", match=MatchValue(value=memory_type)),
+        ]
+    )
+    # Scroll through all entries of this type for the user and check text equality.
+    # In practice structural memories are few (< 20) so this is fast.
+    results, _ = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=user_filter,
+        limit=100,
+        with_payload=True,
+    )
+    for point in results:
+        if point.payload.get("text") == text:
+            return True
+    return False
+
+
 def save_memory(entry: MemoryEntry) -> str:
-    """Persist a single memory entry and return its generated id."""
+    """Persist a single memory entry and return its generated id.
+
+    Skips saving if an identical text entry already exists for this user
+    (prevents duplicate constraint memories from repeated chip confirms).
+    """
     setup_collection()
     client  = _get_client()
+
+    if _text_already_exists(client, entry.user_id, entry.memory_type, entry.text):
+        print(f"  Skipping duplicate memory for {entry.user_id}: {entry.text!r}")
+        return "duplicate"
+
     vector  = embed(entry.text)
     mem_id  = str(uuid.uuid4())
     now     = time.time()
@@ -192,52 +257,85 @@ def get_user_context(user_id: str, query: str) -> dict:
 
 
 def save_constraints_as_memory(user_id: str, constraints: dict):
-    """Persist explicit hard constraints as structural memory."""
-    entries = []
+    """Persist explicit hard constraints as structural memory.
+
+    Each constraint field is stored as a single, always-current entry.
+    Before saving a new value for a field, any existing entry for that
+    field is deleted (delete-then-replace), so only the latest value
+    appears in the memory panel — never stale old values.
+
+    Only fields that are explicitly set (non-None / non-empty) in the
+    incoming constraints dict are touched; unset fields are left alone.
+    """
+    setup_collection()
+    client = _get_client()
+    saved = []
 
     if constraints.get("max_wattage"):
-        entries.append(MemoryEntry(
+        _delete_field_memories(client, user_id, "maximum wattage ")
+        saved.append(save_memory(MemoryEntry(
             user_id=user_id,
             memory_type="structural",
             text=f"maximum wattage {constraints['max_wattage']}W",
             source="constraint",
-        ))
+        )))
 
     if constraints.get("max_price_chf"):
-        entries.append(MemoryEntry(
+        _delete_field_memories(client, user_id, "maximum budget ")
+        saved.append(save_memory(MemoryEntry(
             user_id=user_id,
             memory_type="structural",
             text=f"maximum budget {constraints['max_price_chf']} CHF",
             source="constraint",
-        ))
+        )))
 
     for mat in constraints.get("forbidden_materials", []):
-        entries.append(MemoryEntry(
+        # Forbidden materials are additive — only deduplicate exact text, no delete.
+        saved.append(save_memory(MemoryEntry(
             user_id=user_id,
             memory_type="structural",
             text=f"forbidden material: {mat}",
             source="constraint",
-        ))
+        )))
 
     if constraints.get("kelvin_min") or constraints.get("kelvin_max"):
-        kmin = constraints.get("kelvin_min", "any")
-        kmax = constraints.get("kelvin_max", "any")
-        entries.append(MemoryEntry(
+        # Delete all previous kelvin memories regardless of which variant was stored.
+        _delete_field_memories(client, user_id, "warm white light ")
+        _delete_field_memories(client, user_id, "cool white light ")
+        _delete_field_memories(client, user_id, "color temperature ")
+        kmin = constraints.get("kelvin_min")
+        kmax = constraints.get("kelvin_max")
+        if kmin is not None and kmax is not None:
+            kelvin_text = f"color temperature {kmin}K to {kmax}K"
+        elif kmax is not None:
+            kelvin_text = f"warm white light max {kmax}K"
+        else:
+            kelvin_text = f"cool white light min {kmin}K"
+        saved.append(save_memory(MemoryEntry(
             user_id=user_id,
             memory_type="structural",
-            text=f"color temperature range {kmin}K to {kmax}K",
+            text=kelvin_text,
             source="constraint",
-        ))
+        )))
 
     if constraints.get("room_type"):
-        entries.append(MemoryEntry(
+        _delete_field_memories(client, user_id, "room type: ")
+        saved.append(save_memory(MemoryEntry(
             user_id=user_id,
             memory_type="structural",
             text=f"room type: {constraints['room_type']}",
             source="constraint",
-        ))
+        )))
 
-    saved = save_many(entries)
+    if constraints.get("location"):
+        _delete_field_memories(client, user_id, "location: ")
+        saved.append(save_memory(MemoryEntry(
+            user_id=user_id,
+            memory_type="structural",
+            text=f"location: {constraints['location']}",
+            source="constraint",
+        )))
+
     print(f"  Saved {len(saved)} structural memories for {user_id}")
     return saved
 

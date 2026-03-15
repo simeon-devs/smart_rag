@@ -126,8 +126,11 @@ app.add_middleware(
 )
 
 # In-memory state for the current process. Persistent memory lives in Qdrant.
-constraints_store: dict[str, UserConstraints] = {}
-browsing_store:    dict[str, list[dict]]       = {}
+constraints_store:  dict[str, UserConstraints] = {}
+browsing_store:     dict[str, list[dict]]       = {}
+# Tracks when each user first expressed a given style/finish/mood preference.
+# Keys: user_id → {"preferred_style": datetime, "preferred_finish": datetime, ...}
+style_timestamp_store: dict[str, dict[str, datetime]] = {}
 
 
 class ConstraintsRequest(BaseModel):
@@ -138,6 +141,7 @@ class ConstraintsRequest(BaseModel):
     kelvin_min:          Optional[float] = None
     kelvin_max:          Optional[float] = None
     room_type:           Optional[str]   = None
+    location:            Optional[str]   = None   # "outdoor" | "indoor"
 
 class BrowseRequest(BaseModel):
     user_id:     str
@@ -213,8 +217,79 @@ class ChatResponse(BaseModel):
     frontend:         FrontendContractInfo
 
 
+class ConstraintSuggestion(BaseModel):
+    field:   str
+    label:   str
+    value:   object
+    options: list[str] = Field(default_factory=lambda: ["Yes", "Skip"])
+
+class ExtractRequest(BaseModel):
+    user_id: str
+    message: str
+
+class ExtractResponse(BaseModel):
+    user_id:     str
+    message:     str
+    suggestions: list[ConstraintSuggestion]
+
+
+_EXTRACT_SYSTEM_PROMPT = (
+    "You are a constraint extractor for a lighting recommendation system.\n"
+    "Read the user message and extract ONLY constraints the user explicitly\n"
+    "mentioned or clearly implied. Do not invent constraints.\n\n"
+    "Return a JSON array only. Each item has exactly these fields:\n"
+    "  field: one of [max_price_chf, max_wattage, kelvin_max, kelvin_min,\n"
+    "                 room_type, forbidden_materials, location]\n"
+    "  label: short confirmation question in the same language as the user\n"
+    "  value: extracted value (number, string, or array of strings)\n\n"
+    "CRITICAL — price vs wattage disambiguation:\n"
+    "  - Wattage is ALWAYS between 1W and 200W maximum for lighting products.\n"
+    "  - If the number is above 200 and has no explicit 'W' or 'watt' unit →\n"
+    "    it is ALWAYS max_price_chf, NEVER max_wattage.\n"
+    "  - Never save a value above 200 as max_wattage under any circumstances.\n"
+    "  - If the user mentions CHF, Fr., francs, budget, cost, price, afford, spend,\n"
+    "    or any monetary context → field: max_price_chf\n"
+    "  - If the user mentions watts, W, watt, power consumption, energy → field: max_wattage\n"
+    "  - A bare number with no unit (e.g. '1500', 'under 150') in a product-search\n"
+    "    context means budget → field: max_price_chf\n\n"
+    "Conversion rules:\n"
+    "  'nothing over 200 CHF' → field: max_price_chf, value: 200\n"
+    "  '1500 for a studio'    → field: max_price_chf, value: 1500\n"
+    "  'under 150'            → field: max_price_chf, value: 150\n"
+    "  'warm light'           → field: kelvin_max, value: 2700\n"
+    "  'cool white'           → field: kelvin_min, value: 4000\n"
+    "  'for the bedroom'      → field: room_type, value: 'bedroom'\n"
+    "  'no plastic'           → field: forbidden_materials, value: ['plastic']\n"
+    "  'outdoor'              → field: location, value: 'outdoor'\n"
+    "  'max 40 watts'         → field: max_wattage, value: 40\n\n"
+    "If nothing specific was mentioned → return []\n"
+    "Return only the JSON array. No explanation. No markdown. No code blocks."
+)
+
+
 def get_constraints(user_id: str) -> UserConstraints:
     return constraints_store.get(user_id, UserConstraints())
+
+
+def _record_style_timestamps(user_id: str, overrides: dict) -> None:
+    """Record the first time this user expressed each style preference."""
+    now = datetime.now(timezone.utc)
+    if user_id not in style_timestamp_store:
+        style_timestamp_store[user_id] = {}
+    store = style_timestamp_store[user_id]
+    for key in ("preferred_style", "preferred_finish", "preferred_mood"):
+        if overrides.get(key) and key not in store:
+            store[key] = now
+
+
+def _style_age_days(user_id: str) -> float:
+    """Return how many days ago the oldest active style preference was expressed."""
+    store = style_timestamp_store.get(user_id, {})
+    if not store:
+        return 0.0
+    now   = datetime.now(timezone.utc)
+    oldest = min(store.values())
+    return (now - oldest).total_seconds() / 86400
 
 
 def get_preferences(user_id: str, overrides: dict) -> UserPreferences:
@@ -227,11 +302,13 @@ def get_preferences(user_id: str, overrides: dict) -> UserPreferences:
         delta = now - datetime.fromisoformat(last)
         browsing_age = delta.total_seconds() / 86400
 
+    _record_style_timestamps(user_id, overrides)
+
     return UserPreferences(
         preferred_style   = overrides.get("preferred_style"),
         preferred_finish  = overrides.get("preferred_finish"),
         preferred_mood    = overrides.get("preferred_mood"),
-        style_age_days    = 0.0,
+        style_age_days    = _style_age_days(user_id),
         browsing_age_days = browsing_age,
     )
 
@@ -297,14 +374,16 @@ def root():
 
 @app.post("/constraints")
 def save_constraints(req: ConstraintsRequest):
-    """Store explicit hard constraints for the user."""
+    """Store explicit hard constraints for the user, merging with existing values."""
+    existing = constraints_store.get(req.user_id, UserConstraints())
     constraints = UserConstraints(
-        max_wattage         = req.max_wattage,
-        max_price_chf       = req.max_price_chf,
-        forbidden_materials = req.forbidden_materials,
-        kelvin_min          = req.kelvin_min,
-        kelvin_max          = req.kelvin_max,
-        room_type           = req.room_type,
+        max_wattage         = req.max_wattage         if req.max_wattage         is not None else existing.max_wattage,
+        max_price_chf       = req.max_price_chf       if req.max_price_chf       is not None else existing.max_price_chf,
+        forbidden_materials = req.forbidden_materials if req.forbidden_materials else existing.forbidden_materials,
+        kelvin_min          = req.kelvin_min          if req.kelvin_min          is not None else existing.kelvin_min,
+        kelvin_max          = req.kelvin_max          if req.kelvin_max          is not None else existing.kelvin_max,
+        room_type           = req.room_type           if req.room_type           is not None else existing.room_type,
+        location            = req.location            if req.location            is not None else existing.location,
     )
     constraints_store[req.user_id] = constraints
 
@@ -315,6 +394,7 @@ def save_constraints(req: ConstraintsRequest):
         "kelvin_min":          req.kelvin_min,
         "kelvin_max":          req.kelvin_max,
         "room_type":           req.room_type,
+        "location":            req.location,
     })
 
     return {
@@ -328,6 +408,7 @@ def save_constraints(req: ConstraintsRequest):
             "kelvin_min":          req.kelvin_min,
             "kelvin_max":          req.kelvin_max,
             "room_type":           req.room_type,
+            "location":            req.location,
         },
     }
 
@@ -355,6 +436,41 @@ def log_browse(req: BrowseRequest):
     }
 
 
+@app.post("/extract", response_model=ExtractResponse)
+def extract_constraints(req: ExtractRequest):
+    """Detect constraints in a user message and return confirmation suggestions.
+
+    Never saves anything — detection only. The frontend shows one chip per
+    suggestion; clicking Yes triggers a separate POST /constraints call.
+    """
+    import json
+    import re
+
+    raw = call_groq(_EXTRACT_SYSTEM_PROMPT, req.message)
+
+    suggestions: list[ConstraintSuggestion] = []
+    try:
+        # Strip markdown code fences Groq occasionally adds
+        cleaned = re.sub(r"```[a-z]*\n?", "", raw).strip().strip("`").strip()
+        items = json.loads(cleaned)
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and "field" in item and "label" in item and "value" in item:
+                    suggestions.append(ConstraintSuggestion(
+                        field=str(item["field"]),
+                        label=str(item["label"]),
+                        value=item["value"],
+                    ))
+    except Exception:
+        pass  # JSON parse failed — return empty suggestions, never crash
+
+    return ExtractResponse(
+        user_id=req.user_id,
+        message=req.message,
+        suggestions=suggestions,
+    )
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """Run retrieval, load memory, generate the reply, and return results."""
@@ -362,6 +478,7 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     query_vector = embed(req.message)
+    print(f"[/chat] user={req.user_id!r} msg={req.message!r} vec_len={len(query_vector)} first3={query_vector[:3]}")
 
     constraints = get_constraints(req.user_id)
     preferences = get_preferences(req.user_id, {
@@ -410,6 +527,7 @@ async def chat(req: ChatRequest):
             "kelvin_min":          constraints.kelvin_min,
             "kelvin_max":          constraints.kelvin_max,
             "room_type":           constraints.room_type,
+            "location":            constraints.location,
         },
         user_context = {
             "structural_count": len(user_context["structural"]),
@@ -441,6 +559,7 @@ def debug_constraints(user_id: str):
             "kelvin_min":          c.kelvin_min,
             "kelvin_max":          c.kelvin_max,
             "room_type":           c.room_type,
+            "location":            c.location,
         }
     }
 
