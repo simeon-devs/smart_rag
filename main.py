@@ -125,6 +125,26 @@ app.add_middleware(
     allow_headers     = ["*"],
 )
 
+
+@app.on_event("startup")
+async def warmup():
+    """
+    Called once when Railway starts the server.
+    Wakes up the HuggingFace model so the first real
+    user request is fast.
+    """
+    import asyncio
+    import logging
+    logger = logging.getLogger("mara")
+    logger.info("Warming up HuggingFace embedding model...")
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, embed, "warmup")
+        logger.info("Embedding model warm. MARA ready.")
+    except Exception as e:
+        logger.warning(f"Warmup failed (non-fatal): {e}")
+
+
 # In-memory state for the current process. Persistent memory lives in Qdrant.
 constraints_store:  dict[str, UserConstraints] = {}
 browsing_store:     dict[str, list[dict]]       = {}
@@ -370,6 +390,11 @@ def root():
         "status":    "running",
         "endpoints": ["/constraints", "/browse", "/chat"],
     }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/constraints")
