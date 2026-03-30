@@ -94,6 +94,13 @@ _ACCESSORY_KEYWORDS = (
     "halter",
     "end cap",
     "adapter",
+    "rohrpendel",
+    "kabel",
+    "pendelrohr",
+    "aufhängung",
+    "zubehör",
+    "verbinder",
+    "stromschiene",
 )
 
 
