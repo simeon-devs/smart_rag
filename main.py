@@ -607,3 +607,26 @@ async def debug_memory(user_id: str):
         "episodic":   context["episodic"],
         "summary":    context["summary"],
     }
+
+
+@app.delete("/debug/memory/{user_id}")
+async def delete_memory(user_id: str):
+    from user_memory import _get_client as _mem_client, COLLECTION_NAME
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+    mem_client = _mem_client()
+    mem_client.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=Filter(
+            must=[FieldCondition(
+                key="user_id",
+                match=MatchValue(value=user_id)
+            )]
+        ),
+    )
+    if user_id in constraints_store:
+        del constraints_store[user_id]
+    if user_id in browsing_store:
+        del browsing_store[user_id]
+
+    return {"status": "cleared", "user_id": user_id}
