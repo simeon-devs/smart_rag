@@ -360,3 +360,27 @@ def save_chat_preference(user_id: str, preference_text: str):
         source      = "chat",
     )
     return save_memory(entry)
+
+
+def delete_all_user_memory(user_id: str) -> int:
+    """Delete every Qdrant memory entry for a user. Returns the count deleted."""
+    setup_collection()
+    client = _get_client()
+    user_filter = Filter(
+        must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+    )
+    results, _ = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=user_filter,
+        limit=1000,
+        with_payload=False,
+        with_vectors=False,
+    )
+    ids = [point.id for point in results]
+    if ids:
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=PointIdsList(points=ids),
+        )
+    print(f"  Deleted {len(ids)} memory entries for {user_id}")
+    return len(ids)

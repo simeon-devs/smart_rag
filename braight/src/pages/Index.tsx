@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import type { Product, ChatMessage, ConstraintSuggestion } from "@/types/product";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
@@ -20,10 +20,19 @@ import AuthSplash from "@/components/AuthSplash";
 import type { WishlistWithItems } from "@/hooks/useWishlists";
 import type { ProjectWithItems } from "@/hooks/useProjects";
 
-const MARA_USER_ID = 'braight_user_01';
+function getGuestSessionId(): string {
+  const KEY = 'mara_sid';
+  let sid = sessionStorage.getItem(KEY);
+  if (!sid) {
+    sid = `guest_${crypto.randomUUID()}`;
+    sessionStorage.setItem(KEY, sid);
+  }
+  return sid;
+}
 
 const Index = () => {
   const { user, profile, loading: authLoading } = useAuth();
+  const maraUserId = useMemo(() => user?.id ?? getGuestSessionId(), [user?.id]);
   const { t, locale } = useLanguage();
   const [visibleProducts, setVisibleProducts] = useState<Product[]>([]);
   const [allProducts, setAllProducts] = useState<Product[]>([]);
@@ -79,8 +88,8 @@ const Index = () => {
     lastMessageRef.current = text;
     try {
       let suggestions: ConstraintSuggestion[] = [];
-      try { const extractRes = await extractConstraints(MARA_USER_ID, text); suggestions = extractRes.suggestions || []; } catch {}
-      const chatRes = await chatWithMara(MARA_USER_ID, text);
+      try { const extractRes = await extractConstraints(maraUserId, text); suggestions = extractRes.suggestions || []; } catch {}
+      const chatRes = await chatWithMara(maraUserId, text);
       let articleIds = chatRes.hydration?.ordered_article_ids || [];
       // Fallback: if no ordered_article_ids, use baseline_results or mara_results
       if (articleIds.length === 0) {
@@ -123,7 +132,7 @@ const Index = () => {
       setChatMessages(prev => [...prev, { role: 'assistant', content: t('chat_error') }]);
       setIsThinking(false); setPitMode('idle');
     }
-  }, [user, authLoading, track, hydrateFromSupabase, t]);
+  }, [user, authLoading, maraUserId, track, hydrateFromSupabase, t]);
 
   const handleConstraintAction = useCallback(async (suggestion: ConstraintSuggestion, accepted: boolean) => {
     // Track constraint accept/reject
@@ -133,11 +142,11 @@ const Index = () => {
     });
     if (!accepted) { setChatMessages(prev => prev.map(m => ({ ...m, suggestions: m.suggestions?.filter(s => s.field !== suggestion.field) }))); return; }
     try {
-      await saveConstraints(MARA_USER_ID, { [suggestion.field]: suggestion.value });
+      await saveConstraints(maraUserId, { [suggestion.field]: suggestion.value });
       setChatMessages(prev => prev.map(m => ({ ...m, suggestions: m.suggestions?.filter(s => s.field !== suggestion.field) })));
       setChatMessages(prev => [...prev, { role: 'assistant', content: t('constraint_set', { label: suggestion.label }) }]);
     } catch {}
-  }, [trackInteraction, t]);
+  }, [maraUserId, trackInteraction, t]);
 
   const isProfileComplete = profile && profile.company_name;
 
@@ -161,12 +170,12 @@ const Index = () => {
     });
     // Save browse event as MARA episodic memory (fire-and-forget)
     browseMara(
-      MARA_USER_ID,
+      maraUserId,
       `article_${product.id}`,
       product.very_short_description_de || product.article_number,
       product.short_description_de || '',
     ).catch(() => { /* silent — memory is best-effort */ });
-  }, [track, trackInteraction]);
+  }, [maraUserId, track, trackInteraction]);
 
   const handleProductClose = useCallback(() => {
     if (selectedProduct && productOpenTimeRef.current) {

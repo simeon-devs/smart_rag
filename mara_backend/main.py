@@ -25,11 +25,24 @@ from user_memory import (
     save_browse_as_memory,
     save_chat_preference,
     get_user_context,
+    delete_all_user_memory,
 )
 from embeddings import embed
 
 
-def call_groq(system_prompt: str, user_message: str) -> str:
+MAX_HISTORY_TURNS = 6  # keep last 6 exchanges (12 messages) in context
+_SUMMARY_PROMPT = (
+    "Summarize the following conversation in 3-5 concise sentences, "
+    "preserving only the user's key constraints, preferences, and decisions. "
+    "Be factual and brief — no greetings or filler."
+)
+
+
+def call_groq(
+    system_prompt: str,
+    user_message: str,
+    history: list[dict] | None = None,
+) -> str:
     """Return a natural-language answer from Groq or a fallback message."""
     api_key = os.getenv("GROQ_API_KEY")
 
@@ -41,20 +54,48 @@ def call_groq(system_prompt: str, user_message: str) -> str:
 
     try:
         from groq import Groq
-        client   = Groq(api_key=api_key)
+        client = Groq(api_key=api_key)
+        messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+
         response = client.chat.completions.create(
             model       = "llama-3.3-70b-versatile",
             temperature = 0.6,
             max_tokens  = 400,
-            messages    = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_message},
-            ],
+            messages    = messages,
         )
         return response.choices[0].message.content.strip()
 
     except Exception as e:
         return f"Groq error: {str(e)}"
+
+
+def _summarize_history(history: list[dict]) -> str:
+    """Use Groq to produce a short summary of an older conversation chunk."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        # Fallback: just concatenate the last few exchanges as plain text
+        lines = [f"{m['role'].upper()}: {m['content']}" for m in history[-6:]]
+        return " | ".join(lines)
+    try:
+        from groq import Groq
+        client = Groq(api_key=api_key)
+        convo_text = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in history)
+        response = client.chat.completions.create(
+            model       = "llama-3.3-70b-versatile",
+            temperature = 0.2,
+            max_tokens  = 200,
+            messages    = [
+                {"role": "system", "content": _SUMMARY_PROMPT},
+                {"role": "user",   "content": convo_text},
+            ],
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        lines = [f"{m['role'].upper()}: {m['content']}" for m in history[-4:]]
+        return " | ".join(lines)
 
 
 def build_llm_prompt(
@@ -143,6 +184,10 @@ browsing_store:     dict[str, list[dict]]       = {}
 # Tracks when each user first expressed a given style/finish/mood preference.
 # Keys: user_id → {"preferred_style": datetime, "preferred_finish": datetime, ...}
 style_timestamp_store: dict[str, dict[str, datetime]] = {}
+# Rolling LLM conversation history per user.
+# Each entry: {"role": "user"|"assistant", "content": str}
+# Older turns are compressed into a summary message when MAX_HISTORY_TURNS is exceeded.
+conversation_store: dict[str, list[dict]] = {}
 
 
 class ConstraintsRequest(BaseModel):
@@ -281,6 +326,27 @@ _EXTRACT_SYSTEM_PROMPT = (
 
 def get_constraints(user_id: str) -> UserConstraints:
     return constraints_store.get(user_id, UserConstraints())
+
+
+def get_history(user_id: str) -> list[dict]:
+    return conversation_store.get(user_id, [])
+
+
+def append_to_history(user_id: str, user_msg: str, assistant_msg: str) -> None:
+    """Add the latest exchange and compress older turns if limit is exceeded."""
+    history = conversation_store.setdefault(user_id, [])
+    history.append({"role": "user",      "content": user_msg})
+    history.append({"role": "assistant", "content": assistant_msg})
+
+    max_msgs = MAX_HISTORY_TURNS * 2
+    if len(history) > max_msgs:
+        older  = history[:-max_msgs]
+        recent = history[-max_msgs:]
+        summary = _summarize_history(older)
+        conversation_store[user_id] = [
+            {"role": "system", "content": f"[Earlier conversation summary: {summary}]"},
+            *recent,
+        ]
 
 
 def _record_style_timestamps(user_id: str, overrides: dict) -> None:
@@ -515,7 +581,9 @@ async def chat(req: ChatRequest):
         for p in mara
     ]
     system_prompt = build_llm_prompt(user_context, mara_dicts, baseline)
-    llm_reply     = call_groq(system_prompt, req.message)
+    history       = get_history(req.user_id)
+    llm_reply     = call_groq(system_prompt, req.message, history)
+    append_to_history(req.user_id, req.message, llm_reply)
 
     if req.preferred_style:
         save_chat_preference(req.user_id, f"prefers {req.preferred_style} style lighting")
@@ -593,4 +661,18 @@ async def debug_memory(user_id: str):
         "semantic":   context["semantic"],
         "episodic":   context["episodic"],
         "summary":    context["summary"],
+    }
+
+@app.delete("/debug/memory/{user_id}")
+async def clear_memory(user_id: str):
+    """Wipe all Qdrant memory + in-process state for a user (useful for demo resets)."""
+    deleted = delete_all_user_memory(user_id)
+    constraints_store.pop(user_id, None)
+    browsing_store.pop(user_id, None)
+    style_timestamp_store.pop(user_id, None)
+    conversation_store.pop(user_id, None)
+    return {
+        "status":   "cleared",
+        "user_id":  user_id,
+        "deleted_memory_entries": deleted,
     }
