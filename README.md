@@ -1,117 +1,81 @@
-# MARA — Memory-Augmented Retail Agent
-### Constraint-Preserving Agent Architecture for Long-Term Retail Reasoning
+# MARA
 
-[![Qdrant](https://img.shields.io/badge/Vector%20DB-Qdrant%20Cloud-red)](https://qdrant.tech/)
-[![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688)](https://fastapi.tiangolo.com/)
-[![Mistral](https://img.shields.io/badge/LLM-Mistral%207B-blue)](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2)
-[![Python](https://img.shields.io/badge/Language-Python%203.9+-yellow)](https://www.python.org/)
+MARA is a memory-augmented retail agent for lighting search. It combines vector retrieval, persistent user memory, and hard-constraint enforcement so recommendations stay relevant across sessions.
 
----
+## Core Idea
 
-## 1. Executive Summary
+Standard retrieval ranks products by similarity only. MARA adds:
 
-Retail AI agents frequently fail at long-term reasoning because they treat all memory equally. Over time, critical budget constraints and size preferences fade into conversational noise. **MARA (Memory-Augmented Retail Agent)** solves this by treating memory not just as data to be retrieved, but as a **reparameterized retrieval space**.
+- hard constraints that should never be violated
+- soft preferences that influence ranking
+- episodic browsing signals that decay quickly
 
-Built on **Qdrant Cloud**, MARA implements a three-strata memory architecture that distinguishes between **numeric invariants** (e.g., budget, size) and **adaptive variables** (e.g., style, mood). By applying type-aware exponential decay, MARA ensures that "Hard Constraints" remain conserved quantities over 6-month customer journeys, while seasonal trends evolve naturally.
+## Architecture
 
-> [!IMPORTANT]
-> MARA reduces constraint violation rates from ~37% (baseline RAG) to **~4%** in long-term simulated retail environments.
+- `Supabase` is the source of truth for the catalog
+- `extract_supabase_catalog.py` normalizes that catalog into MARA's canonical schema
+- `Qdrant` stores retrieval-optimized product vectors and user memory
+- a dedicated Hugging Face TEI endpoint generates all embeddings remotely
+- `FastAPI` orchestrates retrieval, memory lookup, and response generation
+- `Groq / Llama 3.3` generates the natural-language reply
 
----
+## Quick Start
 
-## 2. Core Innovation: Retrieval Space Reparameterization
-
-Traditional RAG systems compute simple similarity: `Score = Similarity(x, q)`. MARA modifies the retrieval geometry itself:
-
-$$\text{FinalScore} = \text{Similarity}(x, q) \times \text{StructuralWeight}(x) \times \text{DecayFunction}(\text{type}, t)$$
-
-### 2.1 The Three Strata of Memory
-
-| Memory Type | Examples | Decay Rate (λ) | Physics |
-| :--- | :--- | :--- | :--- |
-| **🏗 Structural** | Budget, Size, Material | λ ≈ 0.01 | **Conserved** (Invariant) |
-| **🎨 Semantic** | Style, Brand Affinity | λ ≈ 0.10 | **Slow Decay** (Adaptive) |
-| **⚡ Episodic** | Recent Browsing, Vibe | λ ≈ 0.30 | **Fast Decay** (Volatile) |
-
----
-
-## 3. Technical Architecture
-
-The backend is built with **Python/FastAPI** and utilizes a **dual-collection Qdrant architecture** to separate invariant constraints from adaptive preferences.
-
-### 3.1 Tech Stack
-- **Vector Database:** Qdrant Cloud (Dual-collection: `structural_memory` & `semantic_episodic_memory`)
-- **LLM:** Mistral-7B-Instruct-v0.2 (via HuggingFace Router)
-- **Embeddings:** `all-MiniLM-L6-v2` (Sentence-Transformers)
-- **API Framework:** FastAPI
-
-### 3.2 Dual-Collection Logic
-- **`structural_memory`**: Stores hard rules (Budget: 200 CHF). Uses near-zero decay to ensure these facts are always "near" in the retrieval space.
-- **`semantic_episodic_memory`**: Stores preferences and history. Uses exponential decay $e^{-\lambda t}$ to let older "noise" fade out while keeping recent context relevant.
-
----
-
-## 4. Setup & Installation
-
-### Prerequisites
-- Python 3.9+
-- Qdrant Cloud Cluster
-- HuggingFace API Token (for Mistral 7B)
-
-### 1. Clone & Environment Setup
 ```bash
-git clone <repository-url>
-cd Mara-cluster/mara_env
-pip install -r requirements.txt # Or install manually: fastapi qdrant-client sentence-transformers python-dotenv requests uvicorn
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env_example .env
+# Fill in HF_EMBEDDING_ENDPOINT_URL with your dedicated TEI endpoint URL first.
+python extract_supabase_catalog.py --output catalog_export.json
+python setup_qdrant.py
+python -m uvicorn main:app --reload --port 8001
 ```
 
-### 2. Configure Environment Variables
-Create a `.env` file in `mara_env/`:
-```env
-QDRANT_URL=your_qdrant_cloud_url
+## Required Environment Variables
+
+```bash
+QDRANT_URL=https://your-qdrant-cluster-url:6333
 QDRANT_API_KEY=your_qdrant_api_key
-HF_TOKEN=your_huggingface_token
+GROQ_API_KEY=gsk_your_groq_api_key
+HF_TOKEN=hf_your_huggingface_token
+HF_EMBEDDING_ENDPOINT_URL=https://your-dedicated-tei-endpoint.endpoints.huggingface.cloud
+HF_EMBED_TIMEOUT_SEC=120
+HF_EMBED_BATCH_SIZE=64
+HF_EMBED_MAX_RETRIES=2
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_ANON_KEY=your_supabase_anon_key
 ```
 
-### 3. Initialize Database
-Run the initialization script to create the necessary Qdrant collections:
-```bash
-python init_db.py
-```
+`HF_EMBEDDING_ENDPOINT_URL` must point to your own dedicated Hugging Face TEI
+endpoint. The backend no longer downloads or runs `sentence-transformers`
+locally, and it does not fall back to shared inference APIs or local models.
 
----
+## API
 
-## 5. Usage
+- `POST /constraints` stores explicit hard constraints
+- `POST /browse` stores browse events as episodic memory
+- `POST /chat` returns the LLM reply, ranked results, and hydration metadata
+- `GET /debug/constraints/{user_id}` inspects active constraints
+- `GET /debug/history/{user_id}` inspects browse history
+- `GET /debug/memory/{user_id}` inspects stored memory
 
-### Starting the Backend
-```bash
-python main.py
-# Server runs on http://0.0.0.0:8000
-```
+## Key Files
 
-### API Endpoints
-- **POST `/chat`**: Main interaction endpoint.
-  - **Payload:** `{"user_id": "user123", "message": "Suggest a minimalist lamp"}`
-  - **Response:** Includes the LLM reply, retrieved context, and a `constraint_violation` flag.
+- `main.py` FastAPI application
+- `mara_engine.py` retrieval, filtering, and reranking
+- `user_memory.py` user memory persistence and retrieval
+- `embeddings.py` remote TEI embedding helpers
+- `extract_supabase_catalog.py` catalog extraction and normalization
+- `setup_qdrant.py` Qdrant indexing
+- `CATALOG_SCHEMA.md` canonical catalog schema
+- `FRONTEND_CONTRACT.md` frontend integration contract
 
-### Populating Memory (Example)
-You can use `memory_manager.py` to simulate a customer profile:
-```python
-from memory_manager import MARAMemoryManager
-manager = MARAMemoryManager()
-manager.add_structural_constraint("user123", "budget", 200, "Maximum price 200 CHF")
-manager.add_interaction("user123", "I love earth tones", "semantic")
-```
+## Frontend Contract
 
----
+The backend returns MARA-ranked results plus hydration metadata. Frontends should:
 
-## 6. Evaluation Framework: LLM-as-a-Judge
-
-MARA includes a dedicated evaluation pipeline that measures:
-1. **Numerical Stability:** Accuracy of budget/size retention.
-2. **Context Coherence:** Reasoning consistency over 6 months.
-3. **Retrieval Precision:** Re-ranking accuracy of reparameterized scores.
-
----
-
-*Confidential — Qdrant Challenge: GenAI in Retail Hackathon Submission*
+1. call `POST /chat`
+2. preserve MARA rank order
+3. hydrate product details from Supabase using `source_article_id`
+4. merge Supabase product data with MARA scores and metadata

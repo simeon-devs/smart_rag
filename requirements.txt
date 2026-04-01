@@ -1,0 +1,8 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+qdrant-client==1.17.0
+huggingface_hub==1.8.0
+groq==0.31.0
+python-dotenv==1.1.1
+supabase==2.15.2
+numpy==1.26.4

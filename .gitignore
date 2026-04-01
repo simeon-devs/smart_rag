@@ -1,1 +1,7 @@
 .env
+old_files/Mara
+old_files/cluster
+__pycache__/
+*.pyc
+catalog_export.json
+.DS_Store
